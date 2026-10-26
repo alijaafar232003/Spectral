@@ -1,8 +1,13 @@
 
 from pathlib import Path
-
+from app.core.bands import (
+    BAND_PRESETS,
+    validate_band,
+    band_center,
+)
 import numpy as np
 import pyqtgraph as pg
+from app.gui.waterfall_widget import WaterfallWidget
 
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -81,6 +86,74 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(config)
 
+        # Frequency-band selection
+        self.band_group = QGroupBox("Frequency Band Selection")
+        band_layout = QVBoxLayout(self.band_group)
+        band_form = QFormLayout()
+
+        self.band_selector = QComboBox()
+        self.band_selector.addItems(
+            list(BAND_PRESETS.keys()) + ["Custom"]
+        )
+
+        self.band_start = QDoubleSpinBox()
+        self.band_start.setRange(1, 6000)
+        self.band_start.setDecimals(3)
+        self.band_start.setSuffix(" MHz")
+
+        self.band_end = QDoubleSpinBox()
+        self.band_end.setRange(1, 6000)
+        self.band_end.setDecimals(3)
+        self.band_end.setSuffix(" MHz")
+
+        band_form.addRow("Preset:", self.band_selector)
+        band_form.addRow("Start Frequency:", self.band_start)
+        band_form.addRow("End Frequency:", self.band_end)
+
+        band_layout.addLayout(band_form)
+
+        self.antenna_label = QLabel()
+        self.antenna_label.setWordWrap(True)
+
+        self.band_preview = QLabel()
+        self.band_preview.setWordWrap(True)
+
+        self.apply_band_button = QPushButton(
+            "Tune to Band Midpoint"
+        )
+
+        band_layout.addWidget(self.antenna_label)
+        band_layout.addWidget(self.band_preview)
+        band_layout.addWidget(self.apply_band_button)
+
+        layout.addWidget(self.band_group)
+
+        # Connect band controls
+        self.band_selector.currentTextChanged.connect(
+            self.on_band_changed
+        )
+
+        self.band_start.valueChanged.connect(
+            self.update_band_preview
+        )
+
+        self.band_end.valueChanged.connect(
+            self.update_band_preview
+        )
+
+        self.sample_rate.valueChanged.connect(
+            self.update_band_preview
+        )
+
+        self.apply_band_button.clicked.connect(
+            self.apply_band
+        )
+
+        # Load the first preset
+        self.on_band_changed(
+            self.band_selector.currentText()
+        )
+         
         # Offline controls
         offline = QGroupBox("Offline Analysis")
         offline_layout = QHBoxLayout(offline)
@@ -139,10 +212,17 @@ class MainWindow(QMainWindow):
         )
 
         layout.addWidget(self.spectrum_plot, 1)
+        # Waterfall visualization
+        self.waterfall_plot = WaterfallWidget(
+            history_rows=180
+        )
+
+        layout.addWidget(self.waterfall_plot, 1)
 
         self.statusBar().showMessage("SpectraIQ Ready")
 
     def set_controls_enabled(self, enabled):
+        self.band_group.setEnabled(enabled)
         self.sample_rate.setEnabled(enabled)
         self.known_center.setEnabled(enabled)
         self.center_frequency.setEnabled(
@@ -151,6 +231,78 @@ class MainWindow(QMainWindow):
         self.sample_format.setEnabled(enabled)
         self.open_button.setEnabled(enabled)
         self.start_button.setEnabled(enabled)
+
+
+
+    def on_band_changed(self, name):
+        is_custom = name == "Custom"
+
+        self.band_start.setEnabled(is_custom)
+        self.band_end.setEnabled(is_custom)
+
+        if not is_custom:
+            start, end, antenna = BAND_PRESETS[name]
+
+            self.band_start.setValue(start)
+            self.band_end.setValue(end)
+
+            self.antenna_label.setText(
+                f"Recommended antenna: {antenna}"
+            )
+        else:
+            self.antenna_label.setText(
+                "Recommended antenna: Use an antenna "
+                "covering your selected frequencies."
+            )
+
+        self.update_band_preview()
+
+
+    def update_band_preview(self, *_):
+        start = self.band_start.value()
+        end = self.band_end.value()
+
+        try:
+            validate_band(start, end)
+        except ValueError as exc:
+            self.band_preview.setText(str(exc))
+            return
+
+        center = band_center(start, end)
+        sample_rate = self.sample_rate.value()
+
+        low = center - sample_rate / 2
+        high = center + sample_rate / 2
+
+        self.band_preview.setText(
+            f"Selected band: {start:g}–{end:g} MHz\n"
+            f"Midpoint: {center:.3f} MHz\n"
+            f"At {sample_rate:g} MS/s, the nominal "
+            f"monitoring window will be "
+            f"{low:.3f}–{high:.3f} MHz.\n"
+            "Full-band scanning will be added in Step 6."
+        )
+
+
+    def apply_band(self):
+        start = self.band_start.value()
+        end = self.band_end.value()
+
+        try:
+            center = band_center(start, end)
+        except ValueError as exc:
+            QMessageBox.warning(
+                self, "Invalid Frequency Band", str(exc)
+            )
+            return
+
+        self.known_center.setChecked(True)
+        self.center_frequency.setValue(center)
+
+        self.statusBar().showMessage(
+            f"Tuned monitoring center to {center:.3f} MHz"
+        )
+
 
     # -------------------------
     # Offline analysis
@@ -235,6 +387,15 @@ class MainWindow(QMainWindow):
         if self.live_worker is not None:
             return
 
+        if not 2 <= self.sample_rate.value() <= 20:
+            QMessageBox.warning(
+                self,
+                "Invalid Sample Rate",
+                "HackRF One supports sample rates "
+                "from 2 to 20 MS/s.",
+            )
+            return
+
         if not self.known_center.isChecked():
             QMessageBox.warning(
                 self,
@@ -272,7 +433,7 @@ class MainWindow(QMainWindow):
         )
 
         self.spectrum_curve.setData([], [])
-
+        self.waterfall_plot.reset()
         self.live_worker.start()
 
     def on_live_connected(self):
@@ -285,6 +446,10 @@ class MainWindow(QMainWindow):
         self.spectrum_curve.setData(
             data["frequencies"],
             data["power"],
+        )
+        self.waterfall_plot.add_spectrum(
+            data["frequencies"],
+             data["power"],
         )
 
         self.statusBar().showMessage(
